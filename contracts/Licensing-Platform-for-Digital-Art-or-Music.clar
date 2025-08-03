@@ -9,8 +9,13 @@
 (define-constant err-license-expired (err u104))
 (define-constant err-invalid-collaborator (err u105))
 (define-constant err-invalid-shares (err u106))
+(define-constant err-escrow-not-found (err u107))
+(define-constant err-escrow-expired (err u108))
+(define-constant err-insufficient-funds (err u109))
+(define-constant err-escrow-already-released (err u110))
 
 (define-data-var next-license-id uint u1)
+(define-data-var next-escrow-id uint u1)
 (define-data-var total-licenses uint u0)
 
 (define-map licenses
@@ -47,6 +52,18 @@
 (define-map collaborator-earnings
     {license-id: uint, collaborator: principal}
     uint
+)
+
+(define-map license-escrows
+    uint
+    {
+        buyer: principal,
+        seller: principal,
+        license-id: uint,
+        amount: uint,
+        expiry-height: uint,
+        released: bool
+    }
 )
 
 (define-read-only (get-license-details (license-id uint))
@@ -277,4 +294,80 @@
 
 (define-read-only (get-collaborator-earnings (license-id uint) (collaborator principal))
     (ok (default-to u0 (map-get? collaborator-earnings {license-id: license-id, collaborator: collaborator})))
+)
+
+(define-public (create-escrow (license-id uint) (seller principal) (expiry-blocks uint))
+    (let
+        (
+            (escrow-id (var-get next-escrow-id))
+            (license (unwrap! (map-get? licenses license-id) err-invalid-license))
+            (price (get price license))
+        )
+        (asserts! (is-license-valid license-id) err-license-expired)
+        (asserts! (>= (stx-get-balance tx-sender) price) err-insufficient-funds)
+        (try! (stx-transfer? price tx-sender (as-contract tx-sender)))
+        (map-set license-escrows escrow-id {
+            buyer: tx-sender,
+            seller: seller,
+            license-id: license-id,
+            amount: price,
+            expiry-height: (+ stacks-block-height expiry-blocks),
+            released: false
+        })
+        (var-set next-escrow-id (+ escrow-id u1))
+        (ok escrow-id)
+    )
+)
+
+(define-public (release-escrow (escrow-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? license-escrows escrow-id) err-escrow-not-found))
+            (buyer (get buyer escrow))
+            (seller (get seller escrow))
+            (license-id (get license-id escrow))
+            (amount (get amount escrow))
+        )
+        (asserts! (not (get released escrow)) err-escrow-already-released)
+        (asserts! (or (is-eq tx-sender buyer) (is-eq tx-sender seller)) err-unauthorized)
+        (asserts! (<= stacks-block-height (get expiry-height escrow)) err-escrow-expired)
+        (try! (as-contract (stx-transfer? amount tx-sender seller)))
+        (try! (nft-transfer? digital-license license-id seller buyer))
+        (let
+            (
+                (license (unwrap! (map-get? licenses license-id) err-invalid-license))
+            )
+            (map-set licenses license-id (merge license {owner: buyer}))
+        )
+        (map-set license-escrows escrow-id (merge escrow {released: true}))
+        (ok true)
+    )
+)
+
+(define-public (refund-escrow (escrow-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? license-escrows escrow-id) err-escrow-not-found))
+            (buyer (get buyer escrow))
+            (amount (get amount escrow))
+        )
+        (asserts! (not (get released escrow)) err-escrow-already-released)
+        (asserts! (or (is-eq tx-sender buyer) (> stacks-block-height (get expiry-height escrow))) err-unauthorized)
+        (try! (as-contract (stx-transfer? amount tx-sender buyer)))
+        (map-set license-escrows escrow-id (merge escrow {released: true}))
+        (ok true)
+    )
+)
+
+(define-read-only (get-escrow-details (escrow-id uint))
+    (ok (unwrap! (map-get? license-escrows escrow-id) err-escrow-not-found))
+)
+
+(define-read-only (is-escrow-expired (escrow-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? license-escrows escrow-id) err-escrow-not-found))
+        )
+        (ok (> stacks-block-height (get expiry-height escrow)))
+    )
 )
