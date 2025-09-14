@@ -13,10 +13,13 @@
 (define-constant err-escrow-expired (err u108))
 (define-constant err-insufficient-funds (err u109))
 (define-constant err-escrow-already-released (err u110))
+(define-constant err-invalid-pricing-strategy (err u111))
+(define-constant err-pricing-not-active (err u112))
 
 (define-data-var next-license-id uint u1)
 (define-data-var next-escrow-id uint u1)
 (define-data-var total-licenses uint u0)
+(define-data-var next-pricing-id uint u1)
 
 (define-map licenses
     uint 
@@ -66,6 +69,30 @@
     }
 )
 
+(define-map dynamic-pricing
+    uint
+    {
+        license-id: uint,
+        strategy: (string-ascii 10),
+        base-price: uint,
+        current-price: uint,
+        demand-factor: uint,
+        price-multiplier: uint,
+        last-updated: uint,
+        is-active: bool
+    }
+)
+
+(define-map license-purchase-count
+    uint
+    uint
+)
+
+(define-map pricing-history
+    uint
+    (list 20 {price: uint, timestamp: uint})
+)
+
 (define-read-only (get-license-details (license-id uint))
     (ok (unwrap! (map-get? licenses license-id) err-invalid-license))
 )
@@ -76,6 +103,33 @@
 
 (define-read-only (get-total-licenses)
     (ok (var-get total-licenses))
+)
+
+(define-read-only (get-current-price (license-id uint))
+    (let
+        (
+            (pricing-info (map-get? dynamic-pricing license-id))
+            (base-license (unwrap! (map-get? licenses license-id) err-invalid-license))
+        )
+        (match pricing-info
+            some-pricing (if (get is-active some-pricing)
+                (ok (get current-price some-pricing))
+                (ok (get price base-license)))
+            (ok (get price base-license))
+        )
+    )
+)
+
+(define-read-only (get-pricing-details (license-id uint))
+    (ok (map-get? dynamic-pricing license-id))
+)
+
+(define-read-only (get-license-demand (license-id uint))
+    (ok (default-to u0 (map-get? license-purchase-count license-id)))
+)
+
+(define-read-only (get-pricing-history (license-id uint))
+    (ok (default-to (list) (map-get? pricing-history license-id)))
 )
 
 (define-public (create-license-with-expiry (ipfs-hash (string-ascii 64)) (price uint) (usage-type (string-ascii 20)) (transferable bool) (duration-blocks (optional uint)) (renewable bool))
@@ -162,6 +216,68 @@
     )
 )
 
+(define-public (enable-dynamic-pricing (license-id uint) (strategy (string-ascii 10)) (price-multiplier uint))
+    (let
+        (
+            (license (unwrap! (map-get? licenses license-id) err-invalid-license))
+            (pricing-id (var-get next-pricing-id))
+        )
+        (asserts! (is-eq tx-sender (get creator license)) err-not-owner)
+        (asserts! (or (is-eq strategy "surge") (or (is-eq strategy "decay") (is-eq strategy "seasonal"))) err-invalid-pricing-strategy)
+        (map-set dynamic-pricing pricing-id {
+            license-id: license-id,
+            strategy: strategy,
+            base-price: (get price license),
+            current-price: (get price license),
+            demand-factor: u1,
+            price-multiplier: price-multiplier,
+            last-updated: stacks-block-height,
+            is-active: true
+        })
+        (var-set next-pricing-id (+ pricing-id u1))
+        (ok pricing-id)
+    )
+)
+
+(define-public (update-pricing (pricing-id uint))
+    (let
+        (
+            (pricing (unwrap! (map-get? dynamic-pricing pricing-id) err-pricing-not-active))
+            (license-id (get license-id pricing))
+            (purchase-count (default-to u0 (map-get? license-purchase-count license-id)))
+            (blocks-since-update (- stacks-block-height (get last-updated pricing)))
+        )
+        (asserts! (get is-active pricing) err-pricing-not-active)
+        (let
+            (
+                (new-price (calculate-new-price pricing purchase-count blocks-since-update))
+                (current-history (default-to (list) (map-get? pricing-history license-id)))
+                (new-history-entry {price: new-price, timestamp: stacks-block-height})
+                (updated-history (unwrap-panic (as-max-len? (append current-history new-history-entry) u20)))
+            )
+            (map-set dynamic-pricing pricing-id (merge pricing {
+                current-price: new-price,
+                demand-factor: (+ u1 (/ purchase-count u10)),
+                last-updated: stacks-block-height
+            }))
+            (map-set pricing-history license-id updated-history)
+            (ok new-price)
+        )
+    )
+)
+
+(define-public (disable-dynamic-pricing (pricing-id uint))
+    (let
+        (
+            (pricing (unwrap! (map-get? dynamic-pricing pricing-id) err-pricing-not-active))
+            (license (unwrap! (map-get? licenses (get license-id pricing)) err-invalid-license))
+        )
+        (asserts! (is-eq tx-sender (get creator license)) err-not-owner)
+        (map-set dynamic-pricing pricing-id (merge pricing {is-active: false}))
+        (ok true)
+    )
+)
+
 
 
 (define-public (create-license (ipfs-hash (string-ascii 64)) (price uint) (usage-type (string-ascii 20)) (transferable bool))
@@ -220,22 +336,24 @@
     (let
         (
             (license (unwrap! (map-get? licenses license-id) err-invalid-license))
-            (price (get price license))
+            (current-price (unwrap-panic (get-current-price license-id)))
             (creator (get creator license))
-            (royalty (/ (* price royalty-percentage) u100))
+            (royalty (/ (* current-price royalty-percentage) u100))
             (is-collaborative (get is-collaborative license))
+            (current-count (default-to u0 (map-get? license-purchase-count license-id)))
         )
         (try! (nft-transfer? digital-license license-id (get owner license) tx-sender))
         (if is-collaborative
-            (try! (distribute-collaborative-payment license-id price royalty))
+            (try! (distribute-collaborative-payment license-id current-price royalty))
             (begin
-                (try! (stx-transfer? price tx-sender (get owner license)))
+                (try! (stx-transfer? current-price tx-sender (get owner license)))
                 (try! (stx-transfer? royalty tx-sender creator))
                 (map-set creator-royalties creator 
                     (+ (default-to u0 (map-get? creator-royalties creator)) royalty))
             )
         )
         (map-set licenses license-id (merge license {owner: tx-sender}))
+        (map-set license-purchase-count license-id (+ current-count u1))
         (ok true)
     )
 )
@@ -286,6 +404,34 @@
 
 (define-private (get-share-percentage (collaborator-info {collaborator: principal, share-percentage: uint}))
     (get share-percentage collaborator-info)
+)
+
+(define-private (min-uint (a uint) (b uint))
+    (if (< a b) a b)
+)
+
+(define-private (max-uint (a uint) (b uint))
+    (if (> a b) a b)
+)
+
+(define-private (calculate-new-price (pricing {license-id: uint, strategy: (string-ascii 10), base-price: uint, current-price: uint, demand-factor: uint, price-multiplier: uint, last-updated: uint, is-active: bool}) (purchase-count uint) (blocks-elapsed uint))
+    (let
+        (
+            (base-price (get base-price pricing))
+            (strategy (get strategy pricing))
+            (multiplier (get price-multiplier pricing))
+        )
+        (if (is-eq strategy "surge")
+            (min-uint (+ base-price (/ (* purchase-count multiplier) u100)) (* base-price u3))
+            (if (is-eq strategy "decay")
+                (max-uint (- base-price (/ (* blocks-elapsed multiplier) u1000)) (/ base-price u2))
+                (if (is-eq strategy "seasonal")
+                    (+ base-price (/ (* (mod stacks-block-height u10000) multiplier) u10000))
+                    base-price
+                )
+            )
+        )
+    )
 )
 
 (define-read-only (get-license-collaborators (license-id uint))
