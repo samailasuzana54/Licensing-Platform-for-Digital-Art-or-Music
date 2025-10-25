@@ -15,11 +15,15 @@
 (define-constant err-escrow-already-released (err u110))
 (define-constant err-invalid-pricing-strategy (err u111))
 (define-constant err-pricing-not-active (err u112))
+(define-constant err-invalid-bundle (err u113))
+(define-constant err-bundle-license-invalid (err u114))
+(define-constant err-discount-exceeds-limit (err u115))
 
 (define-data-var next-license-id uint u1)
 (define-data-var next-escrow-id uint u1)
 (define-data-var total-licenses uint u0)
 (define-data-var next-pricing-id uint u1)
+(define-data-var next-bundle-id uint u1)
 
 (define-map licenses
     uint 
@@ -91,6 +95,24 @@
 (define-map pricing-history
     uint
     (list 20 {price: uint, timestamp: uint})
+)
+
+(define-map license-bundles
+    uint
+    {
+        creator: principal,
+        license-ids: (list 10 uint),
+        bundle-price: uint,
+        discount-percentage: uint,
+        created-at: uint,
+        is-active: bool,
+        total-purchases: uint
+    }
+)
+
+(define-map bundle-purchases
+    {bundle-id: uint, buyer: principal}
+    uint
 )
 
 (define-read-only (get-license-details (license-id uint))
@@ -515,5 +537,136 @@
             (escrow (unwrap! (map-get? license-escrows escrow-id) err-escrow-not-found))
         )
         (ok (> stacks-block-height (get expiry-height escrow)))
+    )
+)
+
+(define-public (create-bundle (license-ids (list 10 uint)) (discount-percentage uint))
+    (let
+        (
+            (bundle-id (var-get next-bundle-id))
+            (total-price (fold + (map get-license-price license-ids) u0))
+            (discounted-price (- total-price (/ (* total-price discount-percentage) u100)))
+        )
+        (asserts! (> (len license-ids) u1) err-invalid-bundle)
+        (asserts! (<= discount-percentage u50) err-discount-exceeds-limit)
+        (asserts! (validate-bundle-licenses license-ids tx-sender) err-bundle-license-invalid)
+        (map-set license-bundles bundle-id {
+            creator: tx-sender,
+            license-ids: license-ids,
+            bundle-price: discounted-price,
+            discount-percentage: discount-percentage,
+            created-at: stacks-block-height,
+            is-active: true,
+            total-purchases: u0
+        })
+        (var-set next-bundle-id (+ bundle-id u1))
+        (ok bundle-id)
+    )
+)
+
+(define-public (purchase-bundle (bundle-id uint))
+    (let
+        (
+            (bundle (unwrap! (map-get? license-bundles bundle-id) err-invalid-bundle))
+            (bundle-price (get bundle-price bundle))
+            (license-ids (get license-ids bundle))
+            (creator (get creator bundle))
+        )
+        (asserts! (get is-active bundle) err-invalid-bundle)
+        (try! (stx-transfer? bundle-price tx-sender creator))
+        (try! (transfer-bundle-licenses license-ids tx-sender))
+        (map-set license-bundles bundle-id (merge bundle {
+            total-purchases: (+ (get total-purchases bundle) u1)
+        }))
+        (map-set bundle-purchases {bundle-id: bundle-id, buyer: tx-sender}
+            (+ u1 (default-to u0 (map-get? bundle-purchases {bundle-id: bundle-id, buyer: tx-sender}))))
+        (ok true)
+    )
+)
+
+(define-public (deactivate-bundle (bundle-id uint))
+    (let
+        (
+            (bundle (unwrap! (map-get? license-bundles bundle-id) err-invalid-bundle))
+        )
+        (asserts! (is-eq tx-sender (get creator bundle)) err-not-owner)
+        (map-set license-bundles bundle-id (merge bundle {is-active: false}))
+        (ok true)
+    )
+)
+
+(define-read-only (get-bundle-details (bundle-id uint))
+    (ok (unwrap! (map-get? license-bundles bundle-id) err-invalid-bundle))
+)
+
+(define-read-only (get-bundle-savings (bundle-id uint))
+    (let
+        (
+            (bundle (unwrap! (map-get? license-bundles bundle-id) err-invalid-bundle))
+            (license-ids (get license-ids bundle))
+            (total-price (fold + (map get-license-price license-ids) u0))
+            (bundle-price (get bundle-price bundle))
+        )
+        (ok (- total-price bundle-price))
+    )
+)
+
+(define-read-only (get-buyer-bundle-purchases (bundle-id uint) (buyer principal))
+    (ok (default-to u0 (map-get? bundle-purchases {bundle-id: bundle-id, buyer: buyer})))
+)
+
+(define-private (get-license-price (license-id uint))
+    (match (map-get? licenses license-id)
+        license-data (get price license-data)
+        u0
+    )
+)
+
+(define-private (validate-bundle-licenses (license-ids (list 10 uint)) (creator principal))
+    (let
+        (
+            (validation-result (fold validate-license-ownership license-ids {creator: creator, valid: true}))
+        )
+        (get valid validation-result)
+    )
+)
+
+(define-private (validate-license-ownership (license-id uint) (context {creator: principal, valid: bool}))
+    (if (get valid context)
+        (match (map-get? licenses license-id)
+            license-data (if (is-eq (get creator license-data) (get creator context))
+                context
+                (merge context {valid: false}))
+            (merge context {valid: false})
+        )
+        context
+    )
+)
+
+(define-private (transfer-bundle-licenses (license-ids (list 10 uint)) (recipient principal))
+    (let
+        (
+            (transfer-result (fold transfer-single-license license-ids {recipient: recipient, success: true}))
+        )
+        (if (get success transfer-result)
+            (ok true)
+            (err u999)
+        )
+    )
+)
+
+(define-private (transfer-single-license (license-id uint) (context {recipient: principal, success: bool}))
+    (if (get success context)
+        (match (map-get? licenses license-id)
+            license-data (match (nft-transfer? digital-license license-id (get owner license-data) (get recipient context))
+                success-transfer (begin
+                    (map-set licenses license-id (merge license-data {owner: (get recipient context)}))
+                    context
+                )
+                error-transfer (merge context {success: false})
+            )
+            (merge context {success: false})
+        )
+        context
     )
 )
