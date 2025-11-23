@@ -18,6 +18,7 @@
 (define-constant err-invalid-bundle (err u113))
 (define-constant err-bundle-license-invalid (err u114))
 (define-constant err-discount-exceeds-limit (err u115))
+(define-constant err-not-approved (err u116))
 
 (define-data-var next-license-id uint u1)
 (define-data-var next-escrow-id uint u1)
@@ -113,6 +114,16 @@
 (define-map bundle-purchases
     {bundle-id: uint, buyer: principal}
     uint
+)
+
+(define-map operator-approvals
+    {owner: principal, operator: principal}
+    bool
+)
+
+(define-map license-approvals
+    uint
+    (optional principal)
 )
 
 (define-read-only (get-license-details (license-id uint))
@@ -668,5 +679,70 @@
             (merge context {success: false})
         )
         context
+    )
+)
+
+(define-read-only (get-approved (license-id uint))
+    (ok (default-to none (map-get? license-approvals license-id)))
+)
+
+(define-read-only (is-approved-for-all (owner principal) (operator principal))
+    (ok (default-to false (map-get? operator-approvals {owner: owner, operator: operator})))
+)
+
+(define-public (approve-operator-for-license (license-id uint) (operator principal))
+    (let
+        (
+            (license (unwrap! (map-get? licenses license-id) err-invalid-license))
+        )
+        (asserts! (is-eq tx-sender (get owner license)) err-not-owner)
+        (map-set license-approvals license-id (some operator))
+        (ok true)
+    )
+)
+
+(define-public (revoke-operator-for-license (license-id uint))
+    (let
+        (
+            (license (unwrap! (map-get? licenses license-id) err-invalid-license))
+        )
+        (asserts! (is-eq tx-sender (get owner license)) err-not-owner)
+        (map-set license-approvals license-id none)
+        (ok true)
+    )
+)
+
+(define-public (set-approval-for-all (operator principal) (approved bool))
+    (if approved
+        (begin
+            (map-set operator-approvals {owner: tx-sender, operator: operator} true)
+            (ok true)
+        )
+        (begin
+            (map-set operator-approvals {owner: tx-sender, operator: operator} false)
+            (ok true)
+        )
+    )
+)
+
+(define-public (operator-transfer (license-id uint) (from principal) (to principal))
+    (let
+        (
+            (license (unwrap! (map-get? licenses license-id) err-invalid-license))
+            (owner (get owner license))
+            (approval-entry (map-get? license-approvals license-id))
+            (is-operator (default-to false (map-get? operator-approvals {owner: owner, operator: tx-sender})))
+            (direct-approved (match approval-entry
+                some-approval (match some-approval op (is-eq op tx-sender) false)
+                false))
+        )
+        (asserts! (is-eq from owner) err-unauthorized)
+        (asserts! (or (is-eq tx-sender owner) direct-approved is-operator) err-not-approved)
+        (asserts! (get is-transferable license) err-unauthorized)
+        (asserts! (is-license-valid license-id) err-license-expired)
+        (try! (nft-transfer? digital-license license-id from to))
+        (map-set licenses license-id (merge license {owner: to}))
+        (map-set license-approvals license-id none)
+        (ok true)
     )
 )
